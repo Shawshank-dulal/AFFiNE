@@ -22,6 +22,11 @@ import {
  * People are stored as user ids: a `member` column holds an array of ids and a
  * `created-by` column a single id. A {@link TicketUsers} directory turns them
  * into names.
+ *
+ * Jira-style boards are recognised by column name: `Key` (SZ-1), `Type`
+ * (Epic, Story, Sub-task, …) and `Parent` (the parent ticket's key). A row
+ * whose title links a doc ("create a linked doc" in AFFiNE) keeps its title
+ * and description in that doc.
  */
 
 export class TicketError extends Error {}
@@ -52,6 +57,12 @@ export interface Ticket {
   databaseId: string;
   title: string;
   status: string | null;
+  /** The "Key" column, e.g. SZ-12. */
+  key: string | null;
+  /** The "Type" column, e.g. Story or Sub-task. */
+  type: string | null;
+  /** Key of the parent ticket, from the "Parent" column. */
+  parent: string | null;
   /** The "Project" column if the board has one, otherwise the board title. */
   project: string | null;
   /** People in the ticket's member columns (assignee, owner, …). */
@@ -70,6 +81,21 @@ export interface TicketUser {
 /** Workspace users by id, used to show and match people by name or email. */
 export type TicketUsers = Map<string, TicketUser>;
 
+export interface TicketContext {
+  users?: TicketUsers;
+  /** Doc titles by id, for tickets whose title links a doc. */
+  docTitles?: Map<string, string>;
+}
+
+export interface TicketSummary {
+  id: string;
+  key: string | null;
+  title: string;
+  type: string | null;
+  status: string | null;
+  assignees: string[];
+}
+
 export interface TicketFilter {
   databaseId?: string;
   status?: string;
@@ -78,6 +104,10 @@ export interface TicketFilter {
   user?: string;
   /** Matched against {@link Ticket.project}. */
   project?: string;
+  /** Ticket type, e.g. Bug. */
+  type?: string;
+  /** Key or id of the parent ticket: lists its sub-tasks / children. */
+  parent?: string;
 }
 
 export interface WorkspacePage {
@@ -226,6 +256,51 @@ function userName(users: TicketUsers | undefined, id: string) {
   return users?.get(id)?.name || id;
 }
 
+function findNamedColumn(
+  columns: TicketColumn[],
+  exact: RegExp,
+  loose?: RegExp,
+  types?: string[]
+) {
+  const candidates = types
+    ? columns.filter(column => types.includes(column.type))
+    : columns;
+  return (
+    candidates.find(column => exact.test(column.name.trim())) ??
+    (loose ? candidates.find(column => loose.test(column.name)) : undefined) ??
+    null
+  );
+}
+
+const TEXT_TYPES = ['rich-text', 'text'];
+
+function findKeyColumn(columns: TicketColumn[]) {
+  return findNamedColumn(
+    columns,
+    /^(key|id|issue key|ticket key)$/i,
+    undefined,
+    TEXT_TYPES
+  );
+}
+
+function findTypeColumn(columns: TicketColumn[]) {
+  return findNamedColumn(
+    columns,
+    /^(type|issue type|ticket type)$/i,
+    undefined,
+    ['select']
+  );
+}
+
+function findParentColumn(columns: TicketColumn[]) {
+  return findNamedColumn(
+    columns,
+    /^(parent|parent key|epic|epic link)$/i,
+    /parent/i,
+    TEXT_TYPES
+  );
+}
+
 function findProjectColumn(columns: TicketColumn[]) {
   return (
     columns.find(column => /^project$/i.test(column.name.trim())) ??
@@ -282,18 +357,27 @@ function projectOf(value: unknown, boardTitle: string) {
     : boardTitle.trim() || null;
 }
 
+function textValue(value: unknown) {
+  if (value instanceof YText) return value.toString().trim() || null;
+  return typeof value === 'string' ? value.trim() || null : null;
+}
+
 function ticketOf(
   doc: YDoc,
   database: YMap<unknown>,
   columns: TicketColumn[],
   rowId: string,
-  users?: TicketUsers
+  ctx: TicketContext = {}
 ): Ticket | null {
+  const { users } = ctx;
   const row = blocks(doc).get(rowId);
   if (!row) return null;
   const text = row.get('prop:text');
   const status = findStatusColumn(columns);
   const projectColumn = findProjectColumn(columns);
+  const keyColumn = findKeyColumn(columns);
+  const typeColumn = findTypeColumn(columns);
+  const parentColumn = findParentColumn(columns);
   const fields: Record<string, unknown> = {};
   const assignees: string[] = [];
   let createdBy: string | null = null;
@@ -312,10 +396,19 @@ function ticketOf(
     }
     if (column === projectColumn) project = formatted;
   }
+  const linkedDocId = linkedDocIdOf(text);
+  const rowTitle = text?.toString().trim() ?? '';
   const ticket: Ticket = {
     id: rowId,
     databaseId: database.get('sys:id') as string,
-    title: text?.toString() ?? '',
+    title: (linkedDocId && ctx.docTitles?.get(linkedDocId)) || rowTitle || '',
+    key: keyColumn ? textValue(cellValue(database, rowId, keyColumn.id)) : null,
+    type: typeColumn
+      ? optionLabel(typeColumn, cellValue(database, rowId, typeColumn.id))
+      : null,
+    parent: parentColumn
+      ? textValue(cellValue(database, rowId, parentColumn.id))
+      : null,
     status: status
       ? (optionLabel(status, cellValue(database, rowId, status.id)) ?? null)
       : null,
@@ -324,9 +417,30 @@ function ticketOf(
     createdBy,
     fields,
   };
-  const linkedDocId = linkedDocIdOf(text);
   if (linkedDocId) ticket.linkedDocId = linkedDocId;
   return ticket;
+}
+
+function summaryOf(ticket: Ticket): TicketSummary {
+  return {
+    id: ticket.id,
+    key: ticket.key,
+    title: ticket.title,
+    type: ticket.type,
+    status: ticket.status,
+    assignees: ticket.assignees,
+  };
+}
+
+function boardTickets(doc: YDoc, database: YMap<unknown>, ctx: TicketContext) {
+  const columns = readColumns(database);
+  return children(database)
+    .map(rowId => ticketOf(doc, database, columns, rowId, ctx))
+    .filter((ticket): ticket is Ticket => !!ticket);
+}
+
+function sameKey(a: string | null | undefined, b: string | null | undefined) {
+  return !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
 export function listBoards(doc: YDoc): TicketBoard[] {
@@ -381,8 +495,9 @@ function ticketUserIds(
 export function listTickets(
   doc: YDoc,
   filter: TicketFilter = {},
-  users?: TicketUsers
+  ctx: TicketContext = {}
 ): Ticket[] {
+  const { users } = ctx;
   const databases = filter.databaseId
     ? [getDatabase(doc, filter.databaseId)]
     : databaseBlocks(doc);
@@ -390,9 +505,15 @@ export function listTickets(
   const query = filter.query?.trim().toLowerCase();
   const user = filter.user?.trim().toLowerCase();
   const project = filter.project?.trim().toLowerCase();
+  const type = filter.type?.trim().toLowerCase();
   const result: Ticket[] = [];
   for (const database of databases) {
     const columns = readColumns(database);
+    // the parent filter takes a key or a row id
+    const parentKey = filter.parent
+      ? (ticketOf(doc, database, columns, filter.parent, ctx)?.key ??
+        filter.parent)
+      : undefined;
     for (const rowId of children(database)) {
       if (
         user &&
@@ -400,9 +521,11 @@ export function listTickets(
       ) {
         continue;
       }
-      const ticket = ticketOf(doc, database, columns, rowId, users);
+      const ticket = ticketOf(doc, database, columns, rowId, ctx);
       if (!ticket) continue;
       if (status && ticket.status?.toLowerCase() !== status) continue;
+      if (type && ticket.type?.toLowerCase() !== type) continue;
+      if (parentKey && !sameKey(ticket.parent, parentKey)) continue;
       if (project && !ticket.project?.toLowerCase().includes(project)) {
         continue;
       }
@@ -419,20 +542,62 @@ export function listTickets(
   return result;
 }
 
-function findTicketDatabase(doc: YDoc, ticketId: string) {
-  const database = databaseBlocks(doc).find(block =>
-    children(block).includes(ticketId)
-  );
-  if (!database) throw new TicketError(`Ticket ${ticketId} not found.`);
-  return database;
+/**
+ * Finds a ticket by row id or by its Key (e.g. SZ-12).
+ */
+function findTicket(doc: YDoc, idOrKey: string) {
+  for (const database of databaseBlocks(doc)) {
+    const rows = children(database);
+    if (rows.includes(idOrKey)) return { database, rowId: idOrKey };
+    const keyColumn = findKeyColumn(readColumns(database));
+    if (!keyColumn) continue;
+    const rowId = rows.find(row =>
+      sameKey(textValue(cellValue(database, row, keyColumn.id)), idOrKey)
+    );
+    if (rowId) return { database, rowId };
+  }
+  throw new TicketError(`Ticket ${idOrKey} not found.`);
 }
 
-export function getTicket(doc: YDoc, ticketId: string, users?: TicketUsers) {
-  const database = findTicketDatabase(doc, ticketId);
+export function hasTicket(doc: YDoc, idOrKey: string) {
+  try {
+    findTicket(doc, idOrKey);
+    return true;
+  } catch (error) {
+    if (error instanceof TicketError) return false;
+    throw error;
+  }
+}
+
+/** Resolves a ticket id or key to the row id. */
+export function resolveTicketId(doc: YDoc, idOrKey: string) {
+  return findTicket(doc, idOrKey).rowId;
+}
+
+/** The doc a ticket's title links to, if it has a description doc. */
+export function linkedDocOf(doc: YDoc, idOrKey: string) {
+  const { rowId } = findTicket(doc, idOrKey);
+  return linkedDocIdOf(blocks(doc).get(rowId)?.get('prop:text'));
+}
+
+export function getTicket(doc: YDoc, idOrKey: string, ctx: TicketContext = {}) {
+  const { database, rowId } = findTicket(doc, idOrKey);
   const board = boardOf(database);
-  const ticket = ticketOf(doc, database, board.columns, ticketId, users);
-  if (!ticket) throw new TicketError(`Ticket ${ticketId} not found.`);
-  return { board, ticket };
+  const ticket = ticketOf(doc, database, board.columns, rowId, ctx);
+  if (!ticket) throw new TicketError(`Ticket ${idOrKey} not found.`);
+  const siblings = boardTickets(doc, database, ctx);
+  const parent = ticket.parent
+    ? siblings.find(other => sameKey(other.key, ticket.parent))
+    : undefined;
+  const subtasks = ticket.key
+    ? siblings.filter(other => sameKey(other.parent, ticket.key))
+    : [];
+  return {
+    board,
+    ticket,
+    parentTicket: parent ? summaryOf(parent) : null,
+    subtasks: subtasks.map(summaryOf),
+  };
 }
 
 function resolveColumn(columns: TicketColumn[], key: string) {
@@ -561,10 +726,32 @@ function toCellValue(
   }
 }
 
+/**
+ * A row's title, optionally as a link to its description doc the way AFFiNE's
+ * "create a linked doc" stores it (blocksuite database note-renderer).
+ */
+function ticketTitleText(title: string, linkedDocId?: string) {
+  const text = new YText();
+  if (linkedDocId) {
+    text.insert(0, ' ', {
+      reference: { type: 'LinkedPage', pageId: linkedDocId },
+    });
+  } else {
+    text.insert(0, title);
+  }
+  return text;
+}
+
 function setRowTitle(doc: YDoc, rowId: string, title: string) {
   const text = blocks(doc).get(rowId)?.get('prop:text');
   if (!(text instanceof YText)) {
     throw new TicketError(`Ticket ${rowId} has no editable title.`);
+  }
+  if (linkedDocIdOf(text)) {
+    // replacing the text would drop the link to the description doc
+    throw new TicketError(
+      `Ticket ${rowId} takes its title from a linked doc; rename that doc instead.`
+    );
   }
   text.delete(0, text.length);
   text.insert(0, title);
@@ -618,6 +805,15 @@ function writeFields(
   }
 }
 
+function isKeyField(database: YMap<unknown>, name: string) {
+  const column = findKeyColumn(readColumns(database));
+  return (
+    !!column &&
+    (name === column.id ||
+      name.trim().toLowerCase() === column.name.trim().toLowerCase())
+  );
+}
+
 function statusField(database: YMap<unknown>, status: string) {
   const column = findStatusColumn(readColumns(database));
   if (!column) {
@@ -628,37 +824,113 @@ function statusField(database: YMap<unknown>, status: string) {
   return { [column.id]: status };
 }
 
+function parentField(
+  doc: YDoc,
+  database: YMap<unknown>,
+  parent: string | null,
+  ctx: TicketContext
+) {
+  const column = findParentColumn(readColumns(database));
+  if (!column) {
+    throw new TicketError('This ticket board has no Parent column.');
+  }
+  if (parent === null) return { [column.id]: null };
+  const parentTicket = getTicket(doc, parent, ctx).ticket;
+  if (parentTicket.databaseId !== database.get('sys:id')) {
+    throw new TicketError(`Ticket ${parent} is on another board.`);
+  }
+  if (!parentTicket.key) {
+    throw new TicketError(`Ticket ${parent} has no Key to reference.`);
+  }
+  return { [column.id]: parentTicket.key };
+}
+
+/**
+ * Next key for a board whose tickets are keyed like SZ-12: the most common
+ * prefix and one past the highest number.
+ */
+function nextKey(doc: YDoc, database: YMap<unknown>) {
+  const column = findKeyColumn(readColumns(database));
+  if (!column) return null;
+  const prefixes = new Map<string, number>();
+  let max = 0;
+  for (const rowId of children(database)) {
+    const match = textValue(cellValue(database, rowId, column.id))?.match(
+      /^([A-Za-z][A-Za-z0-9]*)-(\d+)$/
+    );
+    if (!match) continue;
+    const prefix = match[1].toUpperCase();
+    prefixes.set(prefix, (prefixes.get(prefix) ?? 0) + 1);
+    max = Math.max(max, Number(match[2]));
+  }
+  if (!prefixes.size) return null;
+  const [prefix] = [...prefixes].sort((a, b) => b[1] - a[1])[0];
+  return { columnId: column.id, key: `${prefix}-${max + 1}` };
+}
+
 export function updateTicket(
   doc: YDoc,
-  ticketId: string,
+  idOrKey: string,
   changes: {
     title?: string;
     status?: string;
+    parent?: string | null;
     fields?: Record<string, unknown>;
   },
-  users?: TicketUsers
+  ctx: TicketContext = {}
 ): Uint8Array {
-  const database = findTicketDatabase(doc, ticketId);
+  const { database, rowId } = findTicket(doc, idOrKey);
   const fields: Record<string, unknown> = { ...changes.fields };
   if (changes.status !== undefined) {
     Object.assign(fields, statusField(database, changes.status));
   }
+  if (changes.parent !== undefined) {
+    if (
+      changes.parent !== null &&
+      resolveTicketId(doc, changes.parent) === rowId
+    ) {
+      throw new TicketError('A ticket cannot be its own parent.');
+    }
+    Object.assign(fields, parentField(doc, database, changes.parent, ctx));
+  }
   return mutateDoc(doc, () => {
-    if (changes.title !== undefined) setRowTitle(doc, ticketId, changes.title);
-    writeFields(doc, database, ticketId, fields, users);
+    if (changes.title !== undefined) setRowTitle(doc, rowId, changes.title);
+    writeFields(doc, database, rowId, fields, ctx.users);
   });
 }
 
 export function createTicket(
   doc: YDoc,
-  databaseId: string,
-  input: { title: string; status?: string; fields?: Record<string, unknown> },
-  users?: TicketUsers
+  databaseId: string | undefined,
+  input: {
+    title: string;
+    status?: string;
+    /** Key or id of the parent ticket; also selects its board. */
+    parent?: string;
+    /** Doc holding the ticket's title and description. */
+    linkedDocId?: string;
+    fields?: Record<string, unknown>;
+  },
+  ctx: TicketContext = {}
 ): { ticketId: string; update: Uint8Array } {
-  const database = getDatabase(doc, databaseId);
+  const database = databaseId
+    ? getDatabase(doc, databaseId)
+    : input.parent
+      ? findTicket(doc, input.parent).database
+      : null;
+  if (!database) {
+    throw new TicketError('Pass databaseId, or parent to create a sub-task.');
+  }
   const fields: Record<string, unknown> = { ...input.fields };
   if (input.status !== undefined) {
     Object.assign(fields, statusField(database, input.status));
+  }
+  if (input.parent !== undefined) {
+    Object.assign(fields, parentField(doc, database, input.parent, ctx));
+  }
+  const key = nextKey(doc, database);
+  if (key && !Object.keys(fields).some(name => isKeyField(database, name))) {
+    fields[key.columnId] = key.key;
   }
   const ticketId = nanoid(10);
   const update = mutateDoc(doc, () => {
@@ -669,7 +941,7 @@ export function createTicket(
     row.set('sys:version', 1);
     row.set('sys:children', new YArray());
     row.set('prop:type', 'text');
-    row.set('prop:text', new YText(input.title));
+    row.set('prop:text', ticketTitleText(input.title, input.linkedDocId));
     row.set('prop:collapsed', false);
 
     let rows = database.get('sys:children');
@@ -679,7 +951,7 @@ export function createTicket(
     }
     (rows as YArray<string>).push([ticketId]);
 
-    writeFields(doc, database, ticketId, fields, users);
+    writeFields(doc, database, ticketId, fields, ctx.users);
   });
   return { ticketId, update };
 }

@@ -12,6 +12,7 @@ import {
   collectUserIds,
   createTicket,
   getTicket,
+  linkedDocOf,
   listBoards,
   listTickets,
   listWorkspacePages,
@@ -308,7 +309,7 @@ test('should show and filter tickets by user name, email or creator', t => {
   const doc = addPeopleColumns(createBoardDoc(), false);
 
   t.deepEqual(collectUserIds(doc).sort(), ['u-alice', 'u-bob', 'u-gone']);
-  t.like(listTickets(doc, {}, users)[0], {
+  t.like(listTickets(doc, {}, { users })[0], {
     assignees: ['Alice Smith', 'Bob Jones'],
     createdBy: 'Bob Jones',
     fields: {
@@ -317,10 +318,10 @@ test('should show and filter tickets by user name, email or creator', t => {
     },
   });
   // unknown users fall back to their id
-  t.like(listTickets(doc, {}, users)[1], { assignees: ['u-gone'] });
+  t.like(listTickets(doc, {}, { users })[1], { assignees: ['u-gone'] });
 
   const ids = (filter: Parameters<typeof listTickets>[1]) =>
-    listTickets(doc, filter, users).map(ticket => ticket.id);
+    listTickets(doc, filter, { users }).map(ticket => ticket.id);
   t.deepEqual(ids({ user: 'alice' }), ['row-1', 'row-2']);
   t.deepEqual(ids({ user: 'BOB@stagezero.tech' }), ['row-1']);
   t.deepEqual(ids({ user: 'u-gone' }), ['row-2']);
@@ -331,7 +332,7 @@ test('should show and filter tickets by user name, email or creator', t => {
 test('should filter tickets by project column or board title', t => {
   const withColumn = addPeopleColumns(createBoardDoc(), true);
   t.deepEqual(
-    listTickets(withColumn, { project: 'mobile' }, users).map(ticket => [
+    listTickets(withColumn, { project: 'mobile' }, { users }).map(ticket => [
       ticket.id,
       ticket.project,
     ]),
@@ -355,10 +356,10 @@ test('should assign tickets to members by name or email', t => {
       doc,
       'row-2',
       { fields: { assignee: ['alice smith', 'bobby@example.com'] } },
-      users
+      { users }
     )
   );
-  t.deepEqual(getTicket(remote, 'row-2', users).ticket.assignees, [
+  t.deepEqual(getTicket(remote, 'row-2', { users }).ticket.assignees, [
     'Alice Smith',
     'Bobby Tables',
   ]);
@@ -367,19 +368,21 @@ test('should assign tickets to members by name or email', t => {
     doc,
     'db',
     { title: 'Assigned', fields: { Assignee: 'Bob Jones' } },
-    users
+    { users }
   );
   applyUpdate(remote, update);
-  t.deepEqual(getTicket(remote, ticketId, users).ticket.assignees, [
+  t.deepEqual(getTicket(remote, ticketId, { users }).ticket.assignees, [
     'Bob Jones',
   ]);
 
   t.throws(
-    () => updateTicket(doc, 'row-1', { fields: { Assignee: 'bob' } }, users),
+    () =>
+      updateTicket(doc, 'row-1', { fields: { Assignee: 'bob' } }, { users }),
     { instanceOf: TicketError, message: /matches several users/ }
   );
   t.throws(
-    () => updateTicket(doc, 'row-1', { fields: { Assignee: 'carol' } }, users),
+    () =>
+      updateTicket(doc, 'row-1', { fields: { Assignee: 'carol' } }, { users }),
     { instanceOf: TicketError, message: /No workspace member matches "carol"/ }
   );
   t.throws(
@@ -388,8 +391,176 @@ test('should assign tickets to members by name or email', t => {
         doc,
         'row-1',
         { fields: { 'Created By': 'Bob Jones' } },
-        users
+        { users }
       ),
     { instanceOf: TicketError, message: /cannot be edited/ }
+  );
+});
+
+function jiraBoardDoc() {
+  const doc = new YDoc();
+  const types = YArray.from([
+    ymap({ id: 't-epic', value: 'Epic', color: 'purple' }),
+    ymap({ id: 't-story', value: 'Story', color: 'green' }),
+    ymap({ id: 't-sub', value: 'Sub-task', color: 'teal' }),
+  ]);
+  const statuses = YArray.from([
+    ymap({ id: 's-todo', value: 'To Do', color: 'gray' }),
+    ymap({ id: 's-done', value: 'Done', color: 'green' }),
+  ]);
+  const rows: [string, string, string, string, string | null][] = [
+    ['r1', 'Epic one', 'SZ-1', 't-epic', null],
+    ['r2', 'Story one', 'SZ-2', 't-story', 'SZ-1'],
+    ['r3', 'Sub-task A', 'SZ-3', 't-sub', 'SZ-2'],
+    ['r4', 'Sub-task B', 'SZ-4', 't-sub', 'SZ-2'],
+  ];
+  doc.transact(() => {
+    for (const [id, title] of rows) {
+      block(doc, id, 'affine:paragraph', {
+        type: 'text',
+        text: new YText(title),
+      });
+    }
+    const cells = ymap({});
+    for (const [id, , key, type, parent] of rows) {
+      const row = ymap({
+        'c-key': cell('c-key', new YText(key)),
+        'c-type': cell('c-type', type),
+        'c-status': cell('c-status', 's-todo'),
+      });
+      if (parent) row.set('c-parent', cell('c-parent', new YText(parent)));
+      cells.set(id, row);
+    }
+    block(
+      doc,
+      'db',
+      'affine:database',
+      {
+        title: new YText('SZ'),
+        columns: YArray.from([
+          ymap({
+            id: 'c-title',
+            type: 'title',
+            name: 'Summary',
+            data: ymap({}),
+          }),
+          ymap({ id: 'c-key', type: 'rich-text', name: 'Key', data: ymap({}) }),
+          ymap({
+            id: 'c-type',
+            type: 'select',
+            name: 'Type',
+            data: ymap({ options: types }),
+          }),
+          ymap({
+            id: 'c-status',
+            type: 'select',
+            name: 'Status',
+            data: ymap({ options: statuses }),
+          }),
+          ymap({
+            id: 'c-parent',
+            type: 'rich-text',
+            name: 'Parent',
+            data: ymap({}),
+          }),
+        ]),
+        cells,
+      },
+      rows.map(([id]) => id)
+    );
+  });
+  return doc;
+}
+
+test('should look up tickets by key with parent and sub-tasks', t => {
+  const doc = jiraBoardDoc();
+
+  const story = getTicket(doc, 'sz-2');
+  t.like(story.ticket, {
+    id: 'r2',
+    key: 'SZ-2',
+    type: 'Story',
+    parent: 'SZ-1',
+  });
+  t.like(story.parentTicket, { key: 'SZ-1', title: 'Epic one', type: 'Epic' });
+  t.deepEqual(
+    story.subtasks.map(task => task.key),
+    ['SZ-3', 'SZ-4']
+  );
+  t.deepEqual(getTicket(doc, 'r3').subtasks, []);
+  t.throws(() => getTicket(doc, 'SZ-99'), { instanceOf: TicketError });
+
+  const keys = (filter: Parameters<typeof listTickets>[1]) =>
+    listTickets(doc, filter).map(ticket => ticket.key);
+  t.deepEqual(keys({ parent: 'SZ-2' }), ['SZ-3', 'SZ-4']);
+  t.deepEqual(keys({ parent: 'r1' }), ['SZ-2']);
+  t.deepEqual(keys({ type: 'sub-task' }), ['SZ-3', 'SZ-4']);
+});
+
+test('should create sub-tasks with the next key', t => {
+  const doc = jiraBoardDoc();
+  const remote = roundTrip(doc);
+
+  const { ticketId, update } = createTicket(doc, undefined, {
+    title: 'Sub-task C',
+    parent: 'SZ-2',
+    fields: { Type: 'Sub-task' },
+  });
+  applyUpdate(remote, update);
+  t.like(getTicket(remote, ticketId).ticket, {
+    key: 'SZ-5',
+    parent: 'SZ-2',
+    type: 'Sub-task',
+  });
+  t.deepEqual(
+    getTicket(remote, 'SZ-2').subtasks.map(task => task.key),
+    ['SZ-3', 'SZ-4', 'SZ-5']
+  );
+
+  // re-parent and detach
+  applyUpdate(remote, updateTicket(doc, 'SZ-5', { parent: 'SZ-1' }));
+  t.is(getTicket(remote, 'SZ-5').ticket.parent, 'SZ-1');
+  applyUpdate(remote, updateTicket(doc, 'SZ-5', { parent: null }));
+  t.is(getTicket(remote, 'SZ-5').ticket.parent, null);
+  t.throws(() => updateTicket(doc, 'SZ-5', { parent: 'SZ-5' }), {
+    message: /own parent/,
+  });
+  t.throws(() => createTicket(doc, undefined, { title: 'x' }), {
+    instanceOf: TicketError,
+  });
+});
+
+test('should take titles from linked docs and keep the link', t => {
+  const doc = jiraBoardDoc();
+  const text = doc
+    .getMap<YMap<any>>('blocks')
+    .get('r2')!
+    .get('prop:text') as YText;
+  doc.transact(() => {
+    text.delete(0, text.length);
+    text.insert(0, ' ', { reference: { type: 'LinkedPage', pageId: 'doc-2' } });
+  });
+
+  const docTitles = new Map([['doc-2', 'Story one (with description)']]);
+  t.like(getTicket(doc, 'SZ-2', { docTitles }).ticket, {
+    title: 'Story one (with description)',
+    linkedDocId: 'doc-2',
+  });
+  t.is(linkedDocOf(doc, 'SZ-2'), 'doc-2');
+  t.is(linkedDocOf(doc, 'SZ-3'), undefined);
+  t.throws(() => updateTicket(doc, 'SZ-2', { title: 'Renamed' }), {
+    message: /linked doc/,
+  });
+
+  const created = createTicket(doc, 'db', {
+    title: 'With description',
+    linkedDocId: 'doc-9',
+  });
+  t.is(linkedDocOf(doc, created.ticketId), 'doc-9');
+  t.like(
+    getTicket(doc, created.ticketId, {
+      docTitles: new Map([['doc-9', 'With description']]),
+    }).ticket,
+    { title: 'With description', key: 'SZ-5' }
   );
 });

@@ -155,10 +155,26 @@ A **ticket** is a row of a database block, in either table or kanban view. Its
 select column with "status", "state" or "stage" in its name is used, and
 failing that the first select column.
 
-To set up a board, add a database to a doc and give it a `Status` select
-column with options such as `Todo`, `In Progress` and `Done`. Add any other
-columns you need, for example `Priority` (select), `Points` (number) or `Due`
-(date).
+**Jira-style board:** `templates/make-jira-board.py` builds one, with Key,
+Type (Epic / Story / Task / Bug / Sub-task), Status, Priority, Assignee,
+Reporter, Parent, Sprint, Story Points, Labels, Due and Project columns. It also
+adds Board, Backlog and By epic & type views, plus sample tickets. Import the
+file with **Import → Snapshot**:
+
+```sh
+python3 templates/make-jira-board.py board.zip "" WEB "Website"   # key prefix, project name
+```
+
+To build a board by hand, add a database to a doc and give it a `Status`
+select column with options such as `Todo`, `In Progress` and `Done`.
+
+- **Keys and sub-tasks:** with a `Key` text column (`WEB-12`), tickets can be
+  looked up by key and new tickets get the next key. A `Parent` text column
+  holding the parent's key gives Jira's hierarchy: a story points at its epic,
+  a sub-task at its story. `get_ticket` returns the parent and sub-tasks.
+- **Descriptions:** open a ticket and choose "create a linked doc". The tools
+  read that doc's title as the ticket title and return its content as the
+  description. `create_ticket` with `description` does the same.
 
 - **People:** add a `Member` column such as `Assignee` (and optionally a
   `Created By` column). Tickets show people by name, and can be filtered and
@@ -167,16 +183,19 @@ columns you need, for example `Priority` (select), `Points` (number) or `Due`
   one, and otherwise the board's title. Use one board per project, or one board
   with a `Project` select column.
 
-| Tool                                                         | Mode       | What it does                                                                |
-| ------------------------------------------------------------ | ---------- | --------------------------------------------------------------------------- |
-| `list_ticket_boards`                                         | read       | Boards with columns and status options, in one doc or the whole workspace   |
-| `list_tickets`                                               | read       | Tickets of one doc or the whole workspace, by user, project, status or text |
-| `get_ticket`                                                 | read       | One ticket with all fields, plus `linkedDocId` if its title links a doc     |
-| `update_ticket_status`                                       | read-write | Move a ticket to another status                                             |
-| `update_ticket`                                              | read-write | Change title, status or fields (by column name)                             |
-| `create_ticket`                                              | read-write | Add a ticket to a board                                                     |
-| `read_document`, `doc_search`                                | read       | Read a ticket's linked doc, search the workspace                            |
-| `create_document`, `update_document`, `update_document_meta` | read-write | Create docs from Markdown, replace a doc's body, rename a doc               |
+| Tool                                                         | Mode       | What it does                                                                              |
+| ------------------------------------------------------------ | ---------- | ----------------------------------------------------------------------------------------- |
+| `list_ticket_boards`                                         | read       | Boards with columns and status options, in one doc or the whole workspace                 |
+| `list_tickets`                                               | read       | Tickets of one doc or the whole workspace, by user, project, type, parent, status or text |
+| `get_ticket`                                                 | read       | A ticket by key or id: fields, parent, sub-tasks and description                          |
+| `update_ticket_status`                                       | read-write | Move a ticket to another status                                                           |
+| `update_ticket`                                              | read-write | Change title, status, parent or fields (by column name)                                   |
+| `create_ticket`                                              | read-write | Add a ticket or sub-task, with the next key and an optional description                   |
+| `read_document`, `doc_search`                                | read       | Read a ticket's linked doc, search the workspace                                          |
+| `create_document`, `update_document`, `update_document_meta` | read-write | Create docs from Markdown, replace a doc's body, rename a doc                             |
+
+Tools that take a `ticketId` accept a key such as `SZ-12` and find the board
+themselves when `docId` is left out.
 
 Field values are matched by column name, case-insensitively. Select and
 multi-select fields take option names. Member fields take member names or

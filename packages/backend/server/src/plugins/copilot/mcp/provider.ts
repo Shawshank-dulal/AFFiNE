@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { McpAccessMode } from '@prisma/client';
-import type { Doc as YDoc } from 'yjs';
+import { type Doc as YDoc, encodeStateAsUpdate } from 'yjs';
 import z from 'zod/v3';
 
 import { DocReader, DocWriter } from '../../../core/doc';
@@ -11,10 +11,13 @@ import {
   collectUserIds,
   createTicket,
   getTicket,
+  hasTicket,
+  linkedDocOf,
   listBoards,
   listTickets,
   listWorkspacePages,
   loadDoc,
+  type TicketContext,
   TicketError,
   type TicketUsers,
   updateTicket,
@@ -251,9 +254,17 @@ export class WorkspaceMcpProvider {
     };
 
     // Workspace members plus anyone else referenced by the given docs (e.g.
-    // people who have since left), so ids can be shown and matched by name.
+    // people who have since left), so ids can be shown and matched by name,
+    // and doc titles for tickets whose title links a description doc.
     let members: TicketUsers | undefined;
-    const loadTicketUsers = async (docs: YDoc[]): Promise<TicketUsers> => {
+    let docTitles: Map<string, string> | undefined;
+    const workspacePages = async () => {
+      const root = await loadYDoc(workspaceId);
+      const pages = root ? listWorkspacePages(root) : [];
+      docTitles ??= new Map(pages.map(page => [page.id, page.title]));
+      return pages;
+    };
+    const loadTicketContext = async (docs: YDoc[]): Promise<TicketContext> => {
       if (!members) {
         const [rows] = await this.models.workspaceUser.paginate(workspaceId, {
           first: MAX_TICKET_USERS,
@@ -283,20 +294,17 @@ export class WorkspaceMcpProvider {
           });
         }
       }
-      return users;
+      if (!docTitles) await workspacePages();
+      return { users, docTitles };
     };
 
     // Readable docs of the workspace, for tools that work across projects.
     const readableWorkspaceDocs = async () => {
-      const root = await loadYDoc(workspaceId);
       const pages = await this.ac
         .user(userId)
         .workspace(workspaceId)
         .docs(
-          (root ? listWorkspacePages(root) : []).map(page => ({
-            ...page,
-            docId: page.id,
-          })),
+          (await workspacePages()).map(page => ({ ...page, docId: page.id })),
           'Doc.Read'
         );
       return {
@@ -304,6 +312,33 @@ export class WorkspaceMcpProvider {
         truncated: pages.length > MAX_TICKET_BOARD_SCAN,
       };
     };
+
+    // The doc holding a ticket: the given one, or the first board in the
+    // workspace that has a ticket with this id or key.
+    const findTicketDoc = async (
+      ticketId: string,
+      docId: string | undefined,
+      load: (docId: string) => Promise<YDoc | null>
+    ) => {
+      if (docId) {
+        const doc = await load(docId);
+        return doc ? { docId, doc } : null;
+      }
+      const { pages } = await readableWorkspaceDocs();
+      for (const page of pages) {
+        const doc = await loadYDoc(page.id);
+        if (!doc || !hasTicket(doc, ticketId)) continue;
+        const loaded = load === loadYDoc ? doc : await load(page.id);
+        return loaded ? { docId: page.id, doc: loaded } : null;
+      }
+      return null;
+    };
+    const ticketNotFound = (ticketId: string, docId?: string) =>
+      toolError(
+        docId
+          ? `Doc with id ${docId} not found.`
+          : `Ticket ${ticketId} not found.`
+      );
 
     const runTicketTool = async (
       run: () => Promise<WorkspaceMcpToolResult>
@@ -314,6 +349,16 @@ export class WorkspaceMcpProvider {
         if (error instanceof TicketError) return toolError(error.message);
         throw error;
       }
+    };
+
+    const docIdProperty = {
+      type: 'string',
+      description:
+        'Doc containing the board. Optional: without it the workspace is searched.',
+    };
+    const ticketIdProperty = {
+      type: 'string',
+      description: 'Ticket key (e.g. SZ-12) or ticket id',
     };
 
     const listTicketBoards = defineTool({
@@ -364,12 +409,14 @@ export class WorkspaceMcpProvider {
       name: 'list_tickets',
       title: 'List Tickets',
       description:
-        "List tickets (rows of ticket boards). Without docId it searches every board in the workspace. Filter by user (an assignee or creator, by name or email), project (a board's Project column, or the board title), status or text.",
+        "List tickets (rows of ticket boards). Without docId it searches every board in the workspace. Filter by user (an assignee or creator, by name or email), project (a board's Project column, or the board title), type, parent (sub-tasks of a ticket), status or text.",
       parser: z.object({
         docId: z.string().optional(),
         databaseId: z.string().optional(),
         user: z.string().trim().min(1).max(200).optional(),
         project: z.string().trim().min(1).max(200).optional(),
+        type: z.string().trim().min(1).max(100).optional(),
+        parent: z.string().trim().min(1).max(100).optional(),
         status: z.string().optional(),
         query: z.string().max(500).optional(),
         limit: z.number().int().min(1).max(500).optional(),
@@ -396,6 +443,16 @@ export class WorkspaceMcpProvider {
             description:
               "Project name, matched against the board's Project column or, without one, the board title. Partial, case-insensitive.",
           },
+          type: {
+            type: 'string',
+            description:
+              'Ticket type from the Type column, e.g. Bug or Sub-task',
+          },
+          parent: {
+            type: 'string',
+            description:
+              'Key or id of a ticket: returns its children (sub-tasks, or the stories of an epic)',
+          },
           status: {
             type: 'string',
             description: 'Only tickets with this status (case-insensitive)',
@@ -409,7 +466,17 @@ export class WorkspaceMcpProvider {
         additionalProperties: false,
       },
       execute: async (
-        { docId, databaseId, user, project, status, query, limit },
+        {
+          docId,
+          databaseId,
+          user,
+          project,
+          type,
+          parent,
+          status,
+          query,
+          limit,
+        },
         options
       ) =>
         runTicketTool(async () => {
@@ -435,12 +502,12 @@ export class WorkspaceMcpProvider {
             }
           }
 
-          const users = await loadTicketUsers(sources.map(({ doc }) => doc));
+          const ctx = await loadTicketContext(sources.map(({ doc }) => doc));
           const tickets = sources.flatMap(source =>
             listTickets(
               source.doc,
-              { databaseId, user, project, status, query },
-              users
+              { databaseId, user, project, type, parent, status, query },
+              ctx
             ).map(ticket => ({
               docId: source.id,
               ...(source.title ? { docTitle: source.title } : {}),
@@ -462,23 +529,46 @@ export class WorkspaceMcpProvider {
       name: 'get_ticket',
       title: 'Get Ticket',
       description:
-        'Get a ticket with all of its fields, plus the columns and status options of its board. If the ticket links to a document (linkedDocId), use read_document for its details.',
-      parser: z.object({ docId: z.string(), ticketId: z.string() }),
+        "Get a ticket by key (e.g. SZ-12) or id: all fields, its parent and sub-tasks, its description (the linked doc's content, if any), and the board's columns and status options.",
+      parser: z.object({
+        docId: z.string().optional(),
+        ticketId: z.string().trim().min(1),
+      }),
       inputSchema: {
         type: 'object',
-        properties: {
-          docId: { type: 'string' },
-          ticketId: { type: 'string' },
-        },
-        required: ['docId', 'ticketId'],
+        properties: { docId: docIdProperty, ticketId: ticketIdProperty },
+        required: ['ticketId'],
         additionalProperties: false,
       },
       execute: async ({ docId, ticketId }) =>
         runTicketTool(async () => {
-          const doc = await loadReadableDoc(docId);
-          if (!doc) return toolError(`Doc with id ${docId} not found.`);
-          const users = await loadTicketUsers([doc]);
-          return toolText(JSON.stringify(getTicket(doc, ticketId, users)));
+          const found = await findTicketDoc(ticketId, docId, loadReadableDoc);
+          if (!found) return ticketNotFound(ticketId, docId);
+          const ctx = await loadTicketContext([found.doc]);
+          const result = getTicket(found.doc, ticketId, ctx);
+
+          let description: string | undefined;
+          const linkedDocId = result.ticket.linkedDocId;
+          if (
+            linkedDocId &&
+            (await this.ac
+              .user(userId)
+              .workspace(workspaceId)
+              .doc(linkedDocId)
+              .can('Doc.Read'))
+          ) {
+            description = (
+              await this.reader.getDocMarkdown(workspaceId, linkedDocId, false)
+            )?.markdown;
+          }
+
+          return toolText(
+            JSON.stringify({
+              docId: found.docId,
+              ...result,
+              ...(description !== undefined ? { description } : {}),
+            })
+          );
         }),
     });
 
@@ -500,41 +590,49 @@ export class WorkspaceMcpProvider {
         return writable ? await loadYDoc(docId) : null;
       };
 
+      const ticketResult = async (docId: string, doc: YDoc, ticketId: string) =>
+        toolText(
+          JSON.stringify({
+            success: true,
+            docId,
+            ...getTicket(doc, ticketId, await loadTicketContext([doc])),
+          })
+        );
+
       const updateTicketStatus = defineTool({
         name: 'update_ticket_status',
         title: 'Update Ticket Status',
         description:
           "Move a ticket to another status. The status must be one of the board's status options (see list_ticket_boards).",
         parser: z.object({
-          docId: z.string(),
-          ticketId: z.string(),
+          docId: z.string().optional(),
+          ticketId: z.string().trim().min(1),
           status: z.string().min(1),
         }),
         inputSchema: {
           type: 'object',
           properties: {
-            docId: { type: 'string' },
-            ticketId: { type: 'string' },
+            docId: docIdProperty,
+            ticketId: ticketIdProperty,
             status: { type: 'string' },
           },
-          required: ['docId', 'ticketId', 'status'],
+          required: ['ticketId', 'status'],
           additionalProperties: false,
         },
         execute: async ({ docId, ticketId, status }, options) =>
           runTicketTool(async () => {
-            const doc = await loadWritableDoc(docId);
-            if (!doc) return toolError(`Doc with id ${docId} not found.`);
-            const update = updateTicket(doc, ticketId, { status });
+            const found = await findTicketDoc(ticketId, docId, loadWritableDoc);
+            if (!found) return ticketNotFound(ticketId, docId);
+            const update = updateTicket(found.doc, ticketId, { status });
             const aborted = abortIfNeeded(options.signal);
             if (aborted) return aborted;
-            await this.writer.applyUpdate(workspaceId, docId, update, userId);
-            const users = await loadTicketUsers([doc]);
-            return toolText(
-              JSON.stringify({
-                success: true,
-                ...getTicket(doc, ticketId, users),
-              })
+            await this.writer.applyUpdate(
+              workspaceId,
+              found.docId,
+              update,
+              userId
             );
+            return await ticketResult(found.docId, found.doc, ticketId);
           }),
       });
 
@@ -542,46 +640,77 @@ export class WorkspaceMcpProvider {
         name: 'update_ticket',
         title: 'Update Ticket',
         description:
-          'Update the title, status and/or fields of a ticket. Fields are keyed by column name.',
+          'Update the title, status, parent and/or fields of a ticket. Fields are keyed by column name; set parent to a ticket key to make this a sub-task, or null to detach it.',
         parser: z.object({
-          docId: z.string(),
-          ticketId: z.string(),
-          title: z.string().optional(),
+          docId: z.string().optional(),
+          ticketId: z.string().trim().min(1),
+          title: z.string().trim().min(1).optional(),
           status: z.string().optional(),
+          parent: z.string().trim().min(1).nullable().optional(),
           fields: z.record(z.string(), z.unknown()).optional(),
         }),
         inputSchema: {
           type: 'object',
           properties: {
-            docId: { type: 'string' },
-            ticketId: { type: 'string' },
+            docId: docIdProperty,
+            ticketId: ticketIdProperty,
             title: { type: 'string' },
             status: { type: 'string' },
+            parent: {
+              type: ['string', 'null'],
+              description: 'Key or id of the parent ticket, or null',
+            },
             fields: ticketFieldsSchema,
           },
-          required: ['docId', 'ticketId'],
+          required: ['ticketId'],
           additionalProperties: false,
         },
-        execute: async ({ docId, ticketId, title, status, fields }, options) =>
+        execute: async (
+          { docId, ticketId, title, status, parent, fields },
+          options
+        ) =>
           runTicketTool(async () => {
-            const doc = await loadWritableDoc(docId);
-            if (!doc) return toolError(`Doc with id ${docId} not found.`);
-            const users = await loadTicketUsers([doc]);
+            const found = await findTicketDoc(ticketId, docId, loadWritableDoc);
+            if (!found) return ticketNotFound(ticketId, docId);
+            const ctx = await loadTicketContext([found.doc]);
+            const cleanTitle = title?.replace(/[\r\n]+/g, ' ');
+
+            // A ticket with a description doc takes its title from that doc.
+            const linkedDocId = linkedDocOf(found.doc, ticketId);
             const update = updateTicket(
-              doc,
+              found.doc,
               ticketId,
-              { title: title?.replace(/[\r\n]+/g, ' '), status, fields },
-              users
+              {
+                title: linkedDocId ? undefined : cleanTitle,
+                status,
+                parent,
+                fields,
+              },
+              ctx
             );
             const aborted = abortIfNeeded(options.signal);
             if (aborted) return aborted;
-            await this.writer.applyUpdate(workspaceId, docId, update, userId);
-            return toolText(
-              JSON.stringify({
-                success: true,
-                ...getTicket(doc, ticketId, users),
-              })
+            if (cleanTitle && linkedDocId) {
+              await this.ac
+                .user(userId)
+                .workspace(workspaceId)
+                .doc(linkedDocId)
+                .assert('Doc.Update');
+              await this.writer.updateDocMeta(
+                workspaceId,
+                linkedDocId,
+                { title: cleanTitle },
+                userId
+              );
+              docTitles?.set(linkedDocId, cleanTitle);
+            }
+            await this.writer.applyUpdate(
+              workspaceId,
+              found.docId,
+              update,
+              userId
             );
+            return await ticketResult(found.docId, found.doc, ticketId);
           }),
       });
 
@@ -589,49 +718,104 @@ export class WorkspaceMcpProvider {
         name: 'create_ticket',
         title: 'Create Ticket',
         description:
-          'Create a ticket on a board. Use list_ticket_boards to find the docId, databaseId, field names and status options.',
+          'Create a ticket on a board. Boards with a Key column get the next key (e.g. SZ-13). Pass parent (a ticket key) to create a sub-task on the same board; then docId and databaseId can be omitted. A description is stored as a linked doc, like "create a linked doc" in AFFiNE.',
         parser: z.object({
-          docId: z.string(),
-          databaseId: z.string(),
+          docId: z.string().optional(),
+          databaseId: z.string().optional(),
+          parent: z.string().trim().min(1).optional(),
           title: z.string().trim().min(1),
           status: z.string().optional(),
+          description: z.string().max(100_000).optional(),
           fields: z.record(z.string(), z.unknown()).optional(),
         }),
         inputSchema: {
           type: 'object',
           properties: {
-            docId: { type: 'string' },
-            databaseId: { type: 'string' },
+            docId: docIdProperty,
+            databaseId: {
+              type: 'string',
+              description: 'Board id from list_ticket_boards',
+            },
+            parent: {
+              type: 'string',
+              description: 'Key or id of the parent ticket for a sub-task',
+            },
             title: { type: 'string' },
             status: { type: 'string' },
+            description: {
+              type: 'string',
+              description: 'Markdown description',
+            },
             fields: ticketFieldsSchema,
           },
-          required: ['docId', 'databaseId', 'title'],
+          required: ['title'],
           additionalProperties: false,
         },
         execute: async (
-          { docId, databaseId, title, status, fields },
+          { docId, databaseId, parent, title, status, description, fields },
           options
         ) =>
           runTicketTool(async () => {
-            const doc = await loadWritableDoc(docId);
-            if (!doc) return toolError(`Doc with id ${docId} not found.`);
-            const users = await loadTicketUsers([doc]);
-            const { ticketId, update } = createTicket(
-              doc,
+            if (!databaseId && !parent) {
+              return toolError(
+                'Pass databaseId (see list_ticket_boards), or parent to create a sub-task.'
+              );
+            }
+            let found: { docId: string; doc: YDoc } | null;
+            if (docId) {
+              const doc = await loadWritableDoc(docId);
+              if (!doc) return toolError(`Doc with id ${docId} not found.`);
+              found = { docId, doc };
+            } else if (parent) {
+              // a sub-task goes on its parent's board
+              found = await findTicketDoc(parent, undefined, loadWritableDoc);
+              if (!found) return ticketNotFound(parent);
+            } else {
+              return toolError('docId is required with databaseId.');
+            }
+            const ctx = await loadTicketContext([found.doc]);
+            const cleanTitle = title.replace(/[\r\n]+/g, ' ');
+            const input = { title: cleanTitle, status, parent, fields };
+
+            // validate before creating a description doc
+            createTicket(
+              loadDoc(encodeStateAsUpdate(found.doc)),
               databaseId,
-              { title: title.replace(/[\r\n]+/g, ' '), status, fields },
-              users
+              input,
+              ctx
             );
+
+            let linkedDocId: string | undefined;
+            if (description?.trim()) {
+              await this.ac
+                .user(userId)
+                .workspace(workspaceId)
+                .assert('Workspace.CreateDoc');
+              linkedDocId = (
+                await this.writer.createDoc(
+                  workspaceId,
+                  cleanTitle,
+                  description,
+                  userId
+                )
+              ).docId;
+              docTitles?.set(linkedDocId, cleanTitle);
+            }
             const aborted = abortIfNeeded(options.signal);
             if (aborted) return aborted;
-            await this.writer.applyUpdate(workspaceId, docId, update, userId);
-            return toolText(
-              JSON.stringify({
-                success: true,
-                ...getTicket(doc, ticketId, users),
-              })
+            const { ticketId, update } = createTicket(
+              found.doc,
+              databaseId,
+              { ...input, linkedDocId },
+              ctx
             );
+            await this.writer.applyUpdate(
+              workspaceId,
+              found.docId,
+              update,
+              userId
+            );
+            return await ticketResult(found.docId, found.doc, ticketId);
           }),
       });
 
