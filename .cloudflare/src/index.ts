@@ -101,9 +101,41 @@ async function serveHashedAsset(
   return cacheable;
 }
 
+// AFFiNE's template gallery (affine.pro/templates) imports snapshots from
+// cdn.affine.pro, which only allows CORS from app.affine.pro. Serving them
+// from this domain lets "/template/import?snapshotUrl=…" links work here.
+const TEMPLATE_SNAPSHOT = /^\/template-snapshots\/[\w.-]+\.zip$/;
+const TEMPLATE_CDN = 'https://cdn.affine.pro';
+
+async function serveTemplateSnapshot(
+  request: Request,
+  ctx: ExecutionContext
+): Promise<Response> {
+  const cache = caches.default;
+  const key = new Request(new URL(request.url).toString(), { method: 'GET' });
+  const cached = await cache.match(key);
+  if (cached) return cached;
+
+  const upstream = await fetch(TEMPLATE_CDN + new URL(request.url).pathname);
+  if (upstream.status !== 200) {
+    return new Response('Template not found', { status: upstream.status });
+  }
+  const response = new Response(upstream.body, {
+    headers: {
+      'content-type': 'application/zip',
+      'cache-control': 'public, max-age=86400',
+    },
+  });
+  ctx.waitUntil(cache.put(key, response.clone()));
+  return response;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx): Promise<Response> {
     const { pathname } = new URL(request.url);
+    if (request.method === 'GET' && TEMPLATE_SNAPSHOT.test(pathname)) {
+      return serveTemplateSnapshot(request, ctx);
+    }
     if (request.method === 'GET' && HASHED_ASSET.test(pathname)) {
       return serveHashedAsset(request, env, ctx);
     }
