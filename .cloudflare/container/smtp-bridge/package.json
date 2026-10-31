@@ -1,0 +1,10 @@
+{
+  "name": "affine-smtp-bridge",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "mailparser": "3.9.31",
+    "smtp-server": "3.19.15"
+  }
+}

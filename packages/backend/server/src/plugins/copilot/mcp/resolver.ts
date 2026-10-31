@@ -17,6 +17,7 @@ import { CurrentUser } from '../../../core/auth';
 import { PermissionAccess } from '../../../core/permission';
 import { CopilotEnabled } from '../feature';
 import { McpCredentialService } from './credential';
+import { mcpWriteToolsAvailable } from './provider';
 
 registerEnumType(McpAccessMode, { name: 'McpAccessMode' });
 
@@ -109,7 +110,7 @@ export class McpCredentialResolver {
 
   @Query(() => Boolean)
   mcpCredentialReadWriteAvailable() {
-    return env.dev || env.namespaces.canary;
+    return mcpWriteToolsAvailable();
   }
 
   @Mutation(() => RevealedMcpCredentialType)
@@ -119,8 +120,7 @@ export class McpCredentialResolver {
   ) {
     if (
       input.accessMode === McpAccessMode.READ_WRITE &&
-      !env.dev &&
-      !env.namespaces.canary
+      !mcpWriteToolsAvailable()
     ) {
       throw new BadRequestException('MCP write tools are not available');
     }

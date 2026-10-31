@@ -1,10 +1,24 @@
 import { Injectable } from '@nestjs/common';
 import { McpAccessMode } from '@prisma/client';
+import type { Doc as YDoc } from 'yjs';
 import z from 'zod/v3';
 
 import { DocReader, DocWriter } from '../../../core/doc';
 import { PermissionAccess } from '../../../core/permission';
+import { Models } from '../../../models';
 import { DocumentRetrievalService } from '../retrieval/document';
+import {
+  collectUserIds,
+  createTicket,
+  getTicket,
+  listBoards,
+  listTickets,
+  listWorkspacePages,
+  loadDoc,
+  TicketError,
+  type TicketUsers,
+  updateTicket,
+} from './tickets';
 
 type McpTextContent = {
   type: 'text';
@@ -45,6 +59,15 @@ type ToolExecutorInput<T extends z.ZodTypeAny> = {
   ) => Promise<WorkspaceMcpToolResult>;
 };
 
+/**
+ * Write access through MCP is limited to dev and canary builds on AFFiNE Cloud.
+ * Self-hosted admins control who can mint tokens, so it is always available
+ * there.
+ */
+export function mcpWriteToolsAvailable() {
+  return env.dev || env.namespaces.canary || env.selfhosted;
+}
+
 function toolText(text: string): WorkspaceMcpToolResult {
   return {
     content: [{ type: 'text', text }],
@@ -57,6 +80,18 @@ function toolError(message: string): WorkspaceMcpToolResult {
     content: [{ type: 'text', text: message }],
   };
 }
+
+// Upper bound of docs scanned when looking for ticket boards workspace-wide.
+const MAX_TICKET_BOARD_SCAN = 200;
+const MAX_TICKET_USERS = 1000;
+const DEFAULT_TICKET_LIMIT = 50;
+
+const ticketFieldsSchema = {
+  type: 'object',
+  description:
+    'Field values keyed by column name (or column id). Select / multi-select take option names, member columns (e.g. Assignee) take member names or emails, dates take ISO strings, null clears a field.',
+  additionalProperties: true,
+};
 
 function toInputError(error: z.ZodError) {
   const details = error.issues
@@ -100,7 +135,8 @@ export class WorkspaceMcpProvider {
     private readonly ac: PermissionAccess,
     private readonly reader: DocReader,
     private readonly writer: DocWriter,
-    private readonly retrieval: DocumentRetrievalService
+    private readonly retrieval: DocumentRetrievalService,
+    private readonly models: Models
   ) {}
 
   async for(
@@ -200,12 +236,409 @@ export class WorkspaceMcpProvider {
       },
     });
 
-    const tools = [readDocument, docSearch];
+    const loadYDoc = async (docId: string) => {
+      const record = await this.reader.getDoc(workspaceId, docId);
+      return record?.bin ? loadDoc(record.bin) : null;
+    };
 
-    if (
-      accessMode === McpAccessMode.READ_WRITE &&
-      (env.dev || env.namespaces.canary)
-    ) {
+    const loadReadableDoc = async (docId: string) => {
+      const readable = await this.ac
+        .user(userId)
+        .workspace(workspaceId)
+        .doc(docId)
+        .can('Doc.Read');
+      return readable ? await loadYDoc(docId) : null;
+    };
+
+    // Workspace members plus anyone else referenced by the given docs (e.g.
+    // people who have since left), so ids can be shown and matched by name.
+    let members: TicketUsers | undefined;
+    const loadTicketUsers = async (docs: YDoc[]): Promise<TicketUsers> => {
+      if (!members) {
+        const [rows] = await this.models.workspaceUser.paginate(workspaceId, {
+          first: MAX_TICKET_USERS,
+          offset: 0,
+        });
+        members = new Map();
+        for (const { user } of rows) {
+          if (user) {
+            members.set(user.id, {
+              id: user.id,
+              name: user.name,
+              email: user.email,
+            });
+          }
+        }
+      }
+      const users = new Map(members);
+      const missing = [...new Set(docs.flatMap(collectUserIds))].filter(
+        id => !users.has(id)
+      );
+      if (missing.length) {
+        for (const user of await this.models.user.getWorkspaceUsers(missing)) {
+          users.set(user.id, {
+            id: user.id,
+            name: user.name,
+            email: user.email,
+          });
+        }
+      }
+      return users;
+    };
+
+    // Readable docs of the workspace, for tools that work across projects.
+    const readableWorkspaceDocs = async () => {
+      const root = await loadYDoc(workspaceId);
+      const pages = await this.ac
+        .user(userId)
+        .workspace(workspaceId)
+        .docs(
+          (root ? listWorkspacePages(root) : []).map(page => ({
+            ...page,
+            docId: page.id,
+          })),
+          'Doc.Read'
+        );
+      return {
+        pages: pages.slice(0, MAX_TICKET_BOARD_SCAN),
+        truncated: pages.length > MAX_TICKET_BOARD_SCAN,
+      };
+    };
+
+    const runTicketTool = async (
+      run: () => Promise<WorkspaceMcpToolResult>
+    ): Promise<WorkspaceMcpToolResult> => {
+      try {
+        return await run();
+      } catch (error) {
+        if (error instanceof TicketError) return toolError(error.message);
+        throw error;
+      }
+    };
+
+    const listTicketBoards = defineTool({
+      name: 'list_ticket_boards',
+      title: 'List Ticket Boards',
+      description:
+        'List ticket boards (database blocks such as kanban or table views) with their columns and status options. Pass docId to inspect one document, or omit it to scan the workspace.',
+      parser: z.object({ docId: z.string().optional() }),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          docId: {
+            type: 'string',
+            description: 'Only list boards inside this document',
+          },
+        },
+        additionalProperties: false,
+      },
+      execute: async ({ docId }, options) =>
+        runTicketTool(async () => {
+          if (docId) {
+            const doc = await loadReadableDoc(docId);
+            if (!doc) return toolError(`Doc with id ${docId} not found.`);
+            return toolText(
+              JSON.stringify({
+                boards: listBoards(doc).map(board => ({ docId, ...board })),
+              })
+            );
+          }
+
+          const { pages, truncated } = await readableWorkspaceDocs();
+          const boards = [];
+          for (const page of pages) {
+            const aborted = abortIfNeeded(options.signal);
+            if (aborted) return aborted;
+            const doc = await loadYDoc(page.id);
+            if (!doc) continue;
+            for (const board of listBoards(doc)) {
+              boards.push({ docId: page.id, docTitle: page.title, ...board });
+            }
+          }
+
+          return toolText(JSON.stringify({ boards, truncated }));
+        }),
+    });
+
+    const listTicketsTool = defineTool({
+      name: 'list_tickets',
+      title: 'List Tickets',
+      description:
+        "List tickets (rows of ticket boards). Without docId it searches every board in the workspace. Filter by user (an assignee or creator, by name or email), project (a board's Project column, or the board title), status or text.",
+      parser: z.object({
+        docId: z.string().optional(),
+        databaseId: z.string().optional(),
+        user: z.string().trim().min(1).max(200).optional(),
+        project: z.string().trim().min(1).max(200).optional(),
+        status: z.string().optional(),
+        query: z.string().max(500).optional(),
+        limit: z.number().int().min(1).max(500).optional(),
+      }),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          docId: {
+            type: 'string',
+            description:
+              'Only tickets in this document. Omit to search the workspace.',
+          },
+          databaseId: {
+            type: 'string',
+            description: 'Board id from list_ticket_boards (needs docId)',
+          },
+          user: {
+            type: 'string',
+            description:
+              'Name, email or id of a person in a member column (e.g. Assignee) or the Created By column. Partial, case-insensitive.',
+          },
+          project: {
+            type: 'string',
+            description:
+              "Project name, matched against the board's Project column or, without one, the board title. Partial, case-insensitive.",
+          },
+          status: {
+            type: 'string',
+            description: 'Only tickets with this status (case-insensitive)',
+          },
+          query: {
+            type: 'string',
+            description: 'Text matched against titles and field values',
+          },
+          limit: { type: 'integer', minimum: 1, maximum: 500 },
+        },
+        additionalProperties: false,
+      },
+      execute: async (
+        { docId, databaseId, user, project, status, query, limit },
+        options
+      ) =>
+        runTicketTool(async () => {
+          if (databaseId && !docId) {
+            return toolError('databaseId requires docId.');
+          }
+          let sources: { id: string; title: string; doc: YDoc }[] = [];
+          let truncated = false;
+          if (docId) {
+            const doc = await loadReadableDoc(docId);
+            if (!doc) return toolError(`Doc with id ${docId} not found.`);
+            sources = [{ id: docId, title: '', doc }];
+          } else {
+            const scan = await readableWorkspaceDocs();
+            truncated = scan.truncated;
+            for (const page of scan.pages) {
+              const aborted = abortIfNeeded(options.signal);
+              if (aborted) return aborted;
+              const doc = await loadYDoc(page.id);
+              if (doc && listBoards(doc).length) {
+                sources.push({ id: page.id, title: page.title, doc });
+              }
+            }
+          }
+
+          const users = await loadTicketUsers(sources.map(({ doc }) => doc));
+          const tickets = sources.flatMap(source =>
+            listTickets(
+              source.doc,
+              { databaseId, user, project, status, query },
+              users
+            ).map(ticket => ({
+              docId: source.id,
+              ...(source.title ? { docTitle: source.title } : {}),
+              ...ticket,
+            }))
+          );
+          const max = limit ?? DEFAULT_TICKET_LIMIT;
+          return toolText(
+            JSON.stringify({
+              total: tickets.length,
+              tickets: tickets.slice(0, max),
+              ...(truncated ? { truncated } : {}),
+            })
+          );
+        }),
+    });
+
+    const getTicketTool = defineTool({
+      name: 'get_ticket',
+      title: 'Get Ticket',
+      description:
+        'Get a ticket with all of its fields, plus the columns and status options of its board. If the ticket links to a document (linkedDocId), use read_document for its details.',
+      parser: z.object({ docId: z.string(), ticketId: z.string() }),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          docId: { type: 'string' },
+          ticketId: { type: 'string' },
+        },
+        required: ['docId', 'ticketId'],
+        additionalProperties: false,
+      },
+      execute: async ({ docId, ticketId }) =>
+        runTicketTool(async () => {
+          const doc = await loadReadableDoc(docId);
+          if (!doc) return toolError(`Doc with id ${docId} not found.`);
+          const users = await loadTicketUsers([doc]);
+          return toolText(JSON.stringify(getTicket(doc, ticketId, users)));
+        }),
+    });
+
+    const tools = [
+      readDocument,
+      docSearch,
+      listTicketBoards,
+      listTicketsTool,
+      getTicketTool,
+    ];
+
+    if (accessMode === McpAccessMode.READ_WRITE) {
+      const loadWritableDoc = async (docId: string) => {
+        const writable = await this.ac
+          .user(userId)
+          .workspace(workspaceId)
+          .doc(docId)
+          .can('Doc.Update');
+        return writable ? await loadYDoc(docId) : null;
+      };
+
+      const updateTicketStatus = defineTool({
+        name: 'update_ticket_status',
+        title: 'Update Ticket Status',
+        description:
+          "Move a ticket to another status. The status must be one of the board's status options (see list_ticket_boards).",
+        parser: z.object({
+          docId: z.string(),
+          ticketId: z.string(),
+          status: z.string().min(1),
+        }),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            docId: { type: 'string' },
+            ticketId: { type: 'string' },
+            status: { type: 'string' },
+          },
+          required: ['docId', 'ticketId', 'status'],
+          additionalProperties: false,
+        },
+        execute: async ({ docId, ticketId, status }, options) =>
+          runTicketTool(async () => {
+            const doc = await loadWritableDoc(docId);
+            if (!doc) return toolError(`Doc with id ${docId} not found.`);
+            const update = updateTicket(doc, ticketId, { status });
+            const aborted = abortIfNeeded(options.signal);
+            if (aborted) return aborted;
+            await this.writer.applyUpdate(workspaceId, docId, update, userId);
+            const users = await loadTicketUsers([doc]);
+            return toolText(
+              JSON.stringify({
+                success: true,
+                ...getTicket(doc, ticketId, users),
+              })
+            );
+          }),
+      });
+
+      const updateTicketTool = defineTool({
+        name: 'update_ticket',
+        title: 'Update Ticket',
+        description:
+          'Update the title, status and/or fields of a ticket. Fields are keyed by column name.',
+        parser: z.object({
+          docId: z.string(),
+          ticketId: z.string(),
+          title: z.string().optional(),
+          status: z.string().optional(),
+          fields: z.record(z.string(), z.unknown()).optional(),
+        }),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            docId: { type: 'string' },
+            ticketId: { type: 'string' },
+            title: { type: 'string' },
+            status: { type: 'string' },
+            fields: ticketFieldsSchema,
+          },
+          required: ['docId', 'ticketId'],
+          additionalProperties: false,
+        },
+        execute: async ({ docId, ticketId, title, status, fields }, options) =>
+          runTicketTool(async () => {
+            const doc = await loadWritableDoc(docId);
+            if (!doc) return toolError(`Doc with id ${docId} not found.`);
+            const users = await loadTicketUsers([doc]);
+            const update = updateTicket(
+              doc,
+              ticketId,
+              { title: title?.replace(/[\r\n]+/g, ' '), status, fields },
+              users
+            );
+            const aborted = abortIfNeeded(options.signal);
+            if (aborted) return aborted;
+            await this.writer.applyUpdate(workspaceId, docId, update, userId);
+            return toolText(
+              JSON.stringify({
+                success: true,
+                ...getTicket(doc, ticketId, users),
+              })
+            );
+          }),
+      });
+
+      const createTicketTool = defineTool({
+        name: 'create_ticket',
+        title: 'Create Ticket',
+        description:
+          'Create a ticket on a board. Use list_ticket_boards to find the docId, databaseId, field names and status options.',
+        parser: z.object({
+          docId: z.string(),
+          databaseId: z.string(),
+          title: z.string().trim().min(1),
+          status: z.string().optional(),
+          fields: z.record(z.string(), z.unknown()).optional(),
+        }),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            docId: { type: 'string' },
+            databaseId: { type: 'string' },
+            title: { type: 'string' },
+            status: { type: 'string' },
+            fields: ticketFieldsSchema,
+          },
+          required: ['docId', 'databaseId', 'title'],
+          additionalProperties: false,
+        },
+        execute: async (
+          { docId, databaseId, title, status, fields },
+          options
+        ) =>
+          runTicketTool(async () => {
+            const doc = await loadWritableDoc(docId);
+            if (!doc) return toolError(`Doc with id ${docId} not found.`);
+            const users = await loadTicketUsers([doc]);
+            const { ticketId, update } = createTicket(
+              doc,
+              databaseId,
+              { title: title.replace(/[\r\n]+/g, ' '), status, fields },
+              users
+            );
+            const aborted = abortIfNeeded(options.signal);
+            if (aborted) return aborted;
+            await this.writer.applyUpdate(workspaceId, docId, update, userId);
+            return toolText(
+              JSON.stringify({
+                success: true,
+                ...getTicket(doc, ticketId, users),
+              })
+            );
+          }),
+      });
+
+      tools.push(updateTicketStatus, updateTicketTool, createTicketTool);
+    }
+
+    if (accessMode === McpAccessMode.READ_WRITE && mcpWriteToolsAvailable()) {
       const createDocument = defineTool({
         name: 'create_document',
         title: 'Create Document',

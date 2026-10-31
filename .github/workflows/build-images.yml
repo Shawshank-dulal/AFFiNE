@@ -11,6 +11,14 @@ name: Build Server Candidates
       git-short-hash:
         type: string
         required: true
+      image-name:
+        type: string
+        required: false
+        default: ghcr.io/toeverything/affine
+      platforms:
+        type: string
+        required: false
+        default: linux/amd64,linux/arm64,linux/arm/v7
     outputs:
       image:
         description: Immutable candidate image
@@ -244,10 +252,10 @@ jobs:
           context: .
           push: true
           pull: true
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: ${{ inputs.platforms }}
           provenance: true
           file: .github/deployment/node/Dockerfile
-          tags: ghcr.io/toeverything/affine:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          tags: ${{ inputs.image-name }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
         id: image
     outputs:
-      image: ghcr.io/toeverything/affine@${{ steps.image.outputs.digest }}
+      image: ${{ inputs.image-name }}@${{ steps.image.outputs.digest }}

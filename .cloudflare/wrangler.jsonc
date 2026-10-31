@@ -1,0 +1,44 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "affine",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Serve AFFiNE on your own domain. Keep AFFINE_SERVER_EXTERNAL_URL in sync.
+  "routes": [{ "pattern": "workspace.stagezero.tech", "custom_domain": true }],
+
+  "vars": {
+    "AFFINE_SERVER_NAME": "AFFiNE",
+    "R2_BLOB_BUCKET": "workspace",
+    "R2_AVATAR_BUCKET": "affine-avatars",
+    "R2_COPILOT_BUCKET": "affine-copilot",
+    // How long the container keeps running without requests. Each cold start
+    // runs migrations and takes a while, and the embedded Redis is reset.
+    "AFFINE_SLEEP_AFTER": "1h",
+  },
+
+  "containers": [
+    {
+      "class_name": "AffineContainer",
+      "image": "./container/Dockerfile",
+      "image_build_context": "./container",
+      "image_vars": {
+        // Replaced by the deploy workflow with the image built from this repo.
+        "AFFINE_IMAGE": "ghcr.io/toeverything/affine:stable",
+      },
+      // 1/2 vCPU, 4 GiB memory. AFFiNE needs well over 1 GiB.
+      "instance_type": "standard-1",
+      "max_instances": 1,
+      // Keep the server next to the database: every page load runs many
+      // sequential queries, so distance to Postgres dominates latency.
+      // WEUR is closest to the Supabase project in eu-north-1 (Stockholm).
+      "constraints": { "regions": ["WEUR"] },
+    },
+  ],
+  "durable_objects": {
+    "bindings": [{ "class_name": "AffineContainer", "name": "AFFINE" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AffineContainer"] }],
+}

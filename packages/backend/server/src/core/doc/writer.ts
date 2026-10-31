@@ -297,6 +297,48 @@ export class DocWriter {
     return { success: true };
   }
 
+  /**
+   * Pushes a raw Yjs update produced against the latest doc snapshot.
+   *
+   * @param workspaceId - The workspace ID
+   * @param docId - The document ID to update
+   * @param update - The Yjs update
+   * @param editorId - Actor user ID
+   */
+  async applyUpdate(
+    workspaceId: string,
+    docId: string,
+    update: Uint8Array,
+    editorId: string
+  ): Promise<UpdateDocResult> {
+    if (this.storage.isEmptyBin(update)) {
+      return { success: true };
+    }
+
+    const timestamp = await this.storage.pushDocUpdates(
+      workspaceId,
+      docId,
+      [update],
+      editorId
+    );
+    this.emitDocUpdatesPushed({
+      spaceId: workspaceId,
+      docId,
+      updates: [update],
+      timestamp,
+      editor: editorId,
+    });
+
+    await this.updateDocProperties(
+      workspaceId,
+      docId,
+      { updatedBy: editorId },
+      editorId
+    );
+
+    return { success: true };
+  }
+
   private emitDocUpdatesPushed(payload: {
     spaceId: string;
     docId: string;
